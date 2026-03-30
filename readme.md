@@ -9,29 +9,25 @@ Remote sensing images often suffer from **long-tailed distributions** and **hete
 * **AU-based Label Smoothing**: Mitigates the impact of noisy or ambiguous data.
 
 ## 🛠️ Environment Setup
-The experiments were conducted using **PyTorch 2.1** and **CUDA 12.2**.
 ```bash
 # Create environment
 conda create -n dual_rs python=3.9
 conda activate dual_rs
 
 # Install dependencies
-pip install torch==2.1.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 ```
 
 ## 📊 Data Preparation
 We evaluate our framework on three representative benchmarks:
-* **DOTA**: 15 categories, 98,906 training samples.
-* **DIOR**: 20 categories, 68,025 training samples.
+* **DOTA**: 15 categories.
+* **DIOR**: 20 categories.
 * **FGSC-23**: 23 categories (fine-grained ship classification).
 
-Please organize your data as follows:
-```text
-data/
-├── DOTA/
-├── DIOR/
-└── FGSC-23/
+Please download experiment data as follows:
+```bash
+pip install modelscope
+modelscope download --dataset Asker9527/Remote_Sense_Datasets
 ```
 
 ## 🚀 Training and Evaluation
