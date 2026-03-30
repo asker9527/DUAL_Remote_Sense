@@ -1,5 +1,3 @@
 output/
 __pycache__/
 dongtai.ipynb
-*.txt
-**.txt

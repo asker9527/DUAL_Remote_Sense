@@ -24,12 +24,19 @@ We evaluate our framework on three representative benchmarks:
 * **DIOR**: 20 categories.
 * **FGSC-23**: 23 categories (fine-grained ship classification).
 
-Please download experiment data as follows:
+Before start experiment, please download datasets as follows:
 ```bash
 pip install modelscope
 modelscope download --dataset Asker9527/Remote_Sense_Datasets
 ```
 
+Then, you need set train_path and test_path in tools/config.py
+```text
+data/
+├── DOTA/
+├── DIOR/
+└── FGSC/
+```
 ## 🚀 Training and Evaluation
 The default backbone is **ResNet-50**. Hyperparameters are set to $\sigma=3$ and $\lambda=0.2$ (Default).
 
