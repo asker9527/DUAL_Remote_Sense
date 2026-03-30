@@ -1,313 +1,237 @@
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchvision import datasets, models
 import os
 import gc
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
 from tqdm import tqdm
 from collections import Counter
-from sklearn.metrics import confusion_matrix
-import numpy as np
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+
+# 导入自定义工具包
 from tools import get_loss, local_dataset, configure_optimizer, CMO_weighted_train_loader
-from tools import rand_bbox, sub_optimize_low_confidence, SharpenTransform
-from tools.models import set_output_layer
+from tools import rand_bbox, set_output_layer
 
-# 定义一些超参数
-model_name = 'resnet50'     # 'mobilenet_v2','efficientnet_b0','resnet18','resnet50
-dataset_name = 'FGSC'           # FGSC, DIOR, DOTA
-method_name = 'trust_decomposition'    # CE, trust, w_trust, trust_smooth
-optim_name='warmup+cosine'      # warmup+cosine
-activation = 'softplus'         # softplus, sigmoid, relu
-is_pre = False
-batch_size = 32
-num_epochs = 100 if dataset_name == 'FGSC' else 30   # 训练总轮数
-warmup_epochs = num_epochs/10  # 学习率预热阶段
-max_lr = 1e-3       # 预热后的最大学习率0.001
-min_lr = 1e-6       # 余弦退火的最小学习率
+def parse_args():
+    parser = argparse.ArgumentParser(description='DUAL Framework for Long-tailed Remote Sensing Classification')
+    
+    # 基础配置
+    parser.add_argument('--model', type=str, default='resnet50', choices=['resnet18', 'resnet50', 'mobilenet_v2', 'efficientnet_b0'], help='Backbone model name')
+    parser.add_argument('--dataset', type=str, default='FGSC', choices=['FGSC', 'DIOR', 'DOTA'], help='Dataset name')
+    parser.add_argument('--method', type=str, default='trust_decomposition', help='Training method (CE, trust, trust_decomposition, etc.)')
+    parser.add_argument('--pretrained', action='store_true', help='Use ImageNet pretrained weights')
+    
+    # 训练超参数
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of total epochs to run')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Initial learning rate')
+    parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate for cosine annealing')
+    parser.add_argument('--warmup_ratio', type=float, default=0.1, help='Ratio of warmup epochs')
+    
+    # DUAL/EDL 特定参数
+    parser.add_argument('--activation', type=str, default='softplus', help='Activation for evidential layer')
+    parser.add_argument('--sigma', type=float, default=3.0, help='Exponential scaling factor for EU reweighting')
+    parser.add_argument('--lambda_bal', type=float, default=0.2, help='Balancing factor for KL divergence')
+    
+    # 路径配置
+    parser.add_argument('--output_dir', type=str, default='./output', help='Root directory for outputs')
+    
+    return parser.parse_args()
 
-# save_path = './output/test9'
-save_path = f'./output/{dataset_name}/{ "pretrained" if is_pre else "" }_{model_name}/v2/{method_name}_{optim_name}7-31-sig1-1-a0'
-
-
-# 0. 路径管理
-models_save_path = os.path.join(save_path,'models')
-os.makedirs(models_save_path,exist_ok=True)
-logs_save_path = os.path.join(save_path,'logs')
-os.makedirs(logs_save_path,exist_ok=True)
-results_save_path = os.path.join(save_path,'results')
-os.makedirs(results_save_path,exist_ok=True)
-
-# 1. 数据预处理
-image_size=512
-crop_size=448
-train_transform = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
-                transforms.RandomCrop(crop_size, padding=8),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-            ]
-        )
-test_transform = transforms.Compose(
-    [
+def setup_data(args):
+    """准备数据增强、数据集和加载器"""
+    image_size, crop_size = 512, 448
+    
+    train_transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.RandomCrop(crop_size, padding=8),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    
+    test_transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.CenterCrop((crop_size, crop_size)),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ]
-)
+    ])
 
-train_path, test_path = local_dataset(dataset_name)   # 替换为你的测试集路径
+    train_path, test_path = local_dataset(args.dataset)
+    train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform)
+    test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform)
 
-# 2. 加载数据集
-train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform)
-test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-# weights = pd.read_csv('./traindata_Ua.txt')
-# weights = torch.tensor(weights.values.squeeze(), dtype=torch.float)
-# weights = torch.softmax(-weights, dim=0) 
-# sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader, train_dataset
 
-# 如果是 Tensor，先转换成 list
-label_list = train_dataset.targets
-if isinstance(label_list, torch.Tensor):
-    label_list = label_list.tolist()
+def main():
+    args = parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-cls_num_list = Counter(label_list)
-print(cls_num_list)
+    # 1. 自动生成实验保存路径
+    exp_name = f"{args.dataset}_{args.model}_{args.method}_sig{args.sigma}_pre{args.pretrained}"
+    save_path = os.path.join(args.output_dir, exp_name)
+    models_dir = os.path.join(save_path, 'models')
+    logs_dir = os.path.join(save_path, 'logs')
+    results_dir = os.path.join(save_path, 'results')
+    for d in [models_dir, logs_dir, results_dir]: os.makedirs(d, exist_ok=True)
 
-if 'cmo' in method_name.lower():
-    weighted_train_loader = CMO_weighted_train_loader(cls_num_list=list(cls_num_list.values()), train_dataset=train_dataset,
-                                                      batch_size=batch_size, weighted_alpha=1)
-
-# 3. 加载预训练的ResNet50模型
-if model_name == 'resnet50':
-    model = models.resnet50(pretrained=is_pre)
-elif model_name == 'vgg16':
-    model = models.vgg16(pretrained=is_pre)
-elif model_name == 'mobilenet_v2':
-    model = models.mobilenet_v2(pretrained=is_pre)
-elif model_name == 'efficientnet_b0':
-    model = models.efficientnet_b0(pretrained=is_pre)
-elif model_name == 'resnet18':
-    model = models.resnet18(pretrained=is_pre)
-else:
-    raise NameError('Model Name Error')
-
-
-# 4. 修改最后一层全连接层，以适应你的类别数
-num_classes = len(train_dataset.classes)  # 计算类别数量
-model = set_output_layer(model, num_classes, method_name, activation=activation, )
-
-# model_path = r"E:\Github\LT-Uncertainty\output\FGSC\_reset50\trust_decomposition_warmup+cosine\models\reset50_bestmodel.pth"
-# checkpoint = torch.load(model_path)  # 加载保存的模型
-# model.load_state_dict(checkpoint)  # 将权重加载到模型中
-
-# 5. 使用GPU（如果有）
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = model.to(device)
-print(model)
-
-# 6. 定义损失函数和优化器
-criterion = get_loss(method_name)
-optimizer, scheduler = configure_optimizer(
-    model=model,
-    optim_name=optim_name,
-    max_lr=max_lr,
-    min_lr=min_lr,
-    num_epochs=num_epochs,
-    warmup_epochs=warmup_epochs
-)
-
-writer = SummaryWriter(log_dir=logs_save_path)
-best_eval_acc =0
-best_avg_eval_acc = 0
-best_train_acc = 0
-best_train_avg_acc = 0
-
-W = None
-# 7. 训练模型
-for epoch in range(num_epochs):
-    model.train()  # 设置模型为训练模式
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    all_preds = []
-    all_labels = []
-    current_lr = optimizer.param_groups[0]['lr']
+    # 2. 数据准备
+    train_loader, test_loader, train_dataset = setup_data(args)
+    num_classes = len(train_dataset.classes)
+    cls_num_list = list(Counter(train_dataset.targets).values())
     
-    if 'cmo' in method_name.lower():
-        weighted_train_iter = iter(weighted_train_loader)
+    # CMO 加载器
+    weighted_train_loader = None
+    if 'cmo' in args.method.lower():
+        weighted_train_loader = CMO_weighted_train_loader(
+            cls_num_list=cls_num_list, train_dataset=train_dataset, 
+            batch_size=args.batch_size, weighted_alpha=1
+        )
 
-    for inputs, labels in tqdm(train_loader, desc="Train"):
-        # CMO Data augmentation
-        r = np.random.rand(1)
-        mixup_prob = 0.5    # default
-        beta = 1    # default
-        cmo_gate = 0
-        if 'cmo' in method_name.lower() and warmup_epochs < epoch < num_epochs - warmup_epochs and r < mixup_prob:
-            cmo_gate = 1
-            try:
-                input2, target2 = next(weighted_train_iter)
-            except:
-                weighted_train_iter = iter(weighted_train_loader)
-                input2, target2 = next(weighted_train_iter)
-            # 强制裁剪到和 inputs 一样大小
-            bs = inputs.size(0)
-            input2 = input2[:bs]
-            target2 = target2[:bs]
+    # 3. 模型构建
+    model_ft = {
+        'resnet50': models.resnet50,
+        'resnet18': models.resnet18,
+        'mobilenet_v2': models.mobilenet_v2,
+        'efficientnet_b0': models.efficientnet_b0
+    }[args.model](pretrained=args.pretrained)
+    
+    model = set_output_layer(model_ft, num_classes, args.method, activation=args.activation).to(device)
 
-            # 设备转移
-            input2 = input2.to(device)
-            target2 = target2.to(device)
-            input1, target1 = inputs.to(device), labels.to(device)
+    # 4. 优化器与损失函数
+    criterion = get_loss(args.method)
+    warmup_epochs = args.epochs * args.warmup_ratio
+    optimizer, scheduler = configure_optimizer(
+        model, args.method, args.lr, args.min_lr, args.epochs, warmup_epochs
+    )
 
-            lam = np.random.beta(beta, beta)
-            bbx1, bby1, bbx2, bby2 = rand_bbox(input1.size(), lam)
-            input1[:, :, bbx1:bbx2, bby1:bby2] = input2[:, :, bbx1:bbx2, bby1:bby2]
-            # adjust lambda to exactly match pixel ratio
-            inputs = input1
-            lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input1.size()[-1] * input1.size()[-2]))
-            labels = target1
-        else:
+    writer = SummaryWriter(log_dir=logs_dir)
+    best_acc, best_avg_acc = 0.0, 0.0
+
+    # 5. 训练循环
+    for epoch in range(args.epochs):
+        model.train()
+        running_loss, correct, total = 0.0, 0, 0
+        all_preds, all_labels = [], []
+        
+        # 处理 CMO 迭代器
+        if weighted_train_loader:
+            weighted_iter = iter(weighted_train_loader)
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        for inputs, labels in pbar:
             inputs, labels = inputs.to(device), labels.to(device)
+            bs = inputs.size(0)
 
-        optimizer.zero_grad()
+            # --- CMO 数据增强逻辑 ---
+            cmo_gate = False
+            lam = 1.0
+            if weighted_train_loader and warmup_epochs < epoch < args.epochs - warmup_epochs and np.random.rand() < 0.5:
+                try:
+                    input2, target2 = next(weighted_iter)
+                except StopIteration:
+                    weighted_iter = iter(weighted_train_loader)
+                    input2, target2 = next(weighted_iter)
+                
+                input2, target2 = input2[:bs].to(device), target2[:bs].to(device)
+                lam = np.random.beta(1.0, 1.0)
+                bbx1, bby1, bbx2, bby2 = rand_bbox(inputs.size(), lam)
+                inputs[:, :, bbx1:bbx2, bby1:bby2] = input2[:, :, bbx1:bbx2, bby1:bby2]
+                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (inputs.size()[-1] * inputs.size()[-2]))
+                cmo_gate = True
+
+            # --- 前向传播与损失计算 ---
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            
+            if 'trust' in args.method:
+                # 假设 EDL 损失返回 loss 以及四个分量 A, B, C, D
+                loss, *components = criterion(labels, outputs, num_classes, epoch, args.epochs)
+            elif cmo_gate:
+                loss = criterion(outputs, labels) * lam + criterion(outputs, target2) * (1. - lam)
+            else:
+                loss = criterion(outputs, labels)
+
+            loss.backward()
+            optimizer.step()
+
+            # 统计
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        # --- 每个 Epoch 结束后的逻辑 ---
+        if scheduler: scheduler.step()
+        
+        train_acc = 100. * correct / total
+        avg_cls_acc = calculate_avg_cls_acc(all_labels, all_preds)
+        
+        # 记录训练日志
+        writer.add_scalar('Loss/train', running_loss/len(train_loader), epoch)
+        writer.add_scalar('Acc/train', train_acc, epoch)
+
+        # --- 评估 ---
+        test_acc, test_avg_acc, cls_accs = evaluate(model, test_loader, device)
+        writer.add_scalar('Acc/test', test_acc, epoch)
+        writer.add_scalar('AvgAcc/test', test_avg_acc, epoch)
+
+        print(f"Epoch {epoch+1}: Train Acc {train_acc:.2f}%, Test Acc {test_acc:.2f}%, Test Avg Acc {test_avg_acc:.2f}%")
+
+        # --- 保存最佳模型 ---
+        if test_acc >= best_acc:
+            best_acc = test_acc
+            best_avg_acc = test_avg_acc
+            save_results(results_dir, epoch, test_acc, test_avg_acc, cls_accs)
+            torch.save(model.state_dict(), os.path.join(models_dir, f'{args.model}_best.pth'))
+
+    writer.close()
+
+def calculate_avg_cls_acc(labels, preds):
+    labels, preds = np.array(labels), np.array(preds)
+    cls_accs = []
+    for cls in np.unique(labels):
+        mask = (labels == cls)
+        cls_accs.append(100. * np.sum(preds[mask] == labels[mask]) / np.sum(mask))
+    return np.mean(cls_accs)
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+    for inputs, labels in loader:
+        inputs, labels = inputs.to(device), labels.to(device)
         outputs = model(inputs)
-        if method_name == 'trust_smooth_cmo' and cmo_gate == 1:
-            loss = criterion(target1,outputs,num_classes,epoch,num_epochs,cmo=True) * lam + criterion(target2,outputs,num_classes,epoch,num_epochs,cmo=True) * (1. - lam)
-        elif method_name == 'trust_cmo' and cmo_gate == 1:
-            loss = criterion(target1,outputs,num_classes,epoch,num_epochs) * lam + criterion(target2,outputs,num_classes,epoch,num_epochs) * (1. - lam)
-        elif 'trust' in method_name:
-            loss,A, B,C,D= criterion(labels,outputs,num_classes,epoch,num_epochs)
-        elif cmo_gate == 1:
-            loss = criterion(outputs, target1) * lam + criterion(outputs, target2) * (1. - lam)
-
-        else:
-            loss = criterion(outputs, labels)
-
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item()
-        
-        # 计算准确率
         _, predicted = torch.max(outputs, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        
-        # 收集预测和真实标签用于计算类别准确率
         all_preds.extend(predicted.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
-        if A:
-            with open(os.path.join(results_save_path,'loss.txt'), 'a') as f:  # 使用 'a' 模式追加写入
-                        f.write(f"{loss.cpu()} ")
-                        # f.write(f"{W.cpu()} ")
-                        f.write(f"{A.cpu()} ")
-                        f.write(f"{B.cpu()} ")
-                        f.write(f"{C.cpu()} ")
-                        f.write(f"{D.cpu()} \n")
-
-                    
-    if scheduler is not None:
-        scheduler.step() 
-    epoch_loss = running_loss / len(train_loader)
-    epoch_acc = 100 * correct / total
     
-    # 计算每个类别的正确率
-    classes = torch.unique(torch.tensor(all_labels)).tolist()
-    class_correct = [0] * len(classes)
-    class_total = [0] * len(classes)
-
-    for label, pred in zip(all_labels, all_preds):
-        for i, cls in enumerate(classes):
-            if label == cls:
-                class_total[i] += 1
-                if label == pred:
-                    class_correct[i] += 1
-
-    class_acc = [100 * correct / total if total > 0 else 0 for correct, total in zip(class_correct, class_total)]
-    avg_class_acc = np.mean(class_acc)
+    labels_np, preds_np = np.array(all_labels), np.array(all_preds)
+    unique_classes = np.unique(labels_np)
+    cls_accs = {}
+    for cls in unique_classes:
+        mask = (labels_np == cls)
+        cls_accs[cls] = 100. * np.sum(preds_np[mask] == labels_np[mask]) / np.sum(mask)
     
-    # 打印信息
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, lr: {current_lr:.6f}")
-    print(f"Accuracy: {epoch_acc:.2f}%")
-    print(f"Average Class Accuracy: {avg_class_acc:.2f}%")
-    
-    # 记录到TensorBoard
-    writer.add_scalar('Loss/train', epoch_loss, epoch)
-    writer.add_scalar('Accuracy/train', epoch_acc, epoch)
-    writer.add_scalar('Average Class Accuracy/train', avg_class_acc, epoch)
-    for i, cls in enumerate(classes):
-        writer.add_scalar(f'Class Accuracy/{cls}', class_acc[i], epoch)
-    
-    # 测试
-    if best_train_acc <= epoch_acc or best_train_avg_acc <= avg_class_acc :
-        best_train_acc = epoch_acc
-        best_train_avg_acc = avg_class_acc
+    overall_acc = 100. * np.sum(preds_np == labels_np) / len(labels_np)
+    avg_cls_acc = np.mean(list(cls_accs.values()))
+    return overall_acc, avg_cls_acc, cls_accs
 
-        model.eval()  # 设置模型为评估模式
-        correct = 0
-        total = 0
-        all_preds = []
-        all_labels = []
-        with torch.no_grad():
-            for inputs, labels in test_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                _, predicted = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+def save_results(path, epoch, acc, avg_acc, cls_accs):
+    with open(os.path.join(path, 'results.txt'), 'a') as f:
+        f.write(f"Epoch {epoch+1} | Acc: {acc:.2f}% | Avg Acc: {avg_acc:.2f}%\n")
+        for cls, val in cls_accs.items():
+            f.write(f"  Class {cls}: {val:.2f}%\n")
+        f.write("-" * 30 + "\n")
 
-        # 计算每个类别的正确率
-        classes = torch.unique(torch.tensor(all_labels)).tolist()
-        class_correct = [0] * len(classes)
-        class_total = [0] * len(classes)
-
-        for label, pred in zip(all_labels, all_preds):
-            for i, cls in enumerate(classes):
-                if label == cls:
-                    class_total[i] += 1
-                    if label == pred:
-                        class_correct[i] += 1
-
-        class_acc = [100 * correct / total if total > 0 else 0 for correct, total in zip(class_correct, class_total)]
-        avg_class_acc = np.mean(class_acc)
-        test_acc = 100 * correct / total
-        print(f"Test Accuracy after Epoch {epoch+1}: {test_acc:.2f}%")
-        print(f"Avg Accuracy after Epoch {epoch+1}: {avg_class_acc:.2f}%")
-        writer.add_scalar('Test Accuracy', test_acc, epoch)
-        writer.add_scalar('Test Avg Accuracy', avg_class_acc, epoch)
-
-        if best_eval_acc <= test_acc and best_avg_eval_acc <= avg_class_acc:
-            best_eval_acc = test_acc
-            best_avg_eval_acc = avg_class_acc
-            # === 写入txt文件 ===
-            results_file = os.path.join(results_save_path,'results.txt')
-            with open(results_file, 'a') as f:  # 使用 'a' 模式追加写入
-                f.write(f"Epoch {epoch+1}\n")
-                f.write(f"Overall Accuracy: {test_acc:.2f}%\n")
-                f.write(f"Average Class Accuracy: {avg_class_acc:.2f}%\n")
-                for i, cls in enumerate(classes):
-                    f.write(f"Class {cls} Accuracy: {class_acc[i]:.2f}%\n")
-                f.write("-" * 30 + "\n")
-            # 8. 保存模型
-            # model_save_path = os.path.join(models_save_path,f'{model_name}_model{epoch}.pth')
-            model_save_path = os.path.join(models_save_path,f'{model_name}_bestmodel.pth')
-            torch.save(model.state_dict(), model_save_path)
-    model_save_path = os.path.join(models_save_path,f'{model_name}_model{epoch}.pth')
-    torch.save(model.state_dict(), model_save_path)
-    # torch.cuda.empty_cache()
-    # torch.cuda.ipc_collect()    
-
-writer.close()
+if __name__ == '__main__':
+    main()

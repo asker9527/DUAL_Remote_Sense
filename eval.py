@@ -1,190 +1,109 @@
-import torch.nn.functional as F
+import os
+import argparse
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-from torchvision import datasets, models
-import os
 from tqdm import tqdm
-from collections import Counter
-from sklearn.metrics import confusion_matrix
-import numpy as np
-from torch.utils.tensorboard import SummaryWriter
-from tools import get_loss, local_dataset, configure_optimizer, CMO_weighted_train_loader, rand_bbox
-from torch.special import digamma, gammaln
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+from torch.special import digamma
 
-def edl_entropy_decomposition(alpha: torch.Tensor):
+# 导入自定义工具包 (确保路径正确)
+from tools import local_dataset, set_output_layer
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='EDL Uncertainty Testing Script')
+    parser.add_argument('--model', type=str, default='resnet50', help='Model architecture')
+    parser.add_argument('--dataset', type=str, default='FGSC', help='Dataset name')
+    parser.add_argument('--method', type=str, default='trust_decomposition', help='Method name')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for testing')
+    parser.add_argument('--checkpoint_dir', type=str, required=True, help='Directory containing .pth files')
+    parser.add_argument('--save_dir', type=str, default='./test_results', help='Directory to save CSVs')
+    parser.add_argument('--start_idx', type=int, default=0, help='Start index of checkpoints')
+    parser.add_argument('--end_idx', type=int, default=100, help='End index of checkpoints')
+    return parser.parse_args()
+
+def edl_uncertainty_decomposition(alpha):
     """
-    计算基于熵的 EDL 不确定性分解（Total / Epistemic / Aleatoric）
-
-    参数：
-        alpha: Tensor, shape (B, K)
-            Dirichlet 参数（通常 = softplus(logits) + 1）
-
-    返回：
-        total_entropy:   (B,) 期望分布的熵（总不确定性）
-        epistemic_entropy: (B,) Dirichlet 熵（模型不确定性）
-        aleatoric_entropy: (B,) 数据不确定性
+    计算基于熵的 EDL 不确定性分解 (支持 Batch)
+    alpha: Tensor, shape (B, K), 对应 EDL 的证据参数 (softplus(logits) + 1)
     """
-    alpha = torch.clamp(alpha, min=1e-6) 
-    S = torch.sum(alpha)     # (B, 1)
-    probs = alpha / S                             # E[p_k], shape (B, K)
+    K = alpha.shape[1]
+    S = torch.sum(alpha, dim=1, keepdim=True)  # (B, 1)
+    probs = alpha / S  # E[p], shape (B, K)
     
-    # Total entropy of expected probability
-    total_entropy = -torch.sum(probs * torch.log(probs))  # (B,)
+    # 1. Total Entropy (Up)
+    # 增加 epsilon 防止 log(0)
+    total_entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=1)
 
-    # Dirichlet entropy = epistemic
-    psi_S = digamma(S + 1)  # [B, 1]
-    psi_alpha = digamma(alpha + 1)  # [B, C]
-    aleatoric = torch.sum(probs * (psi_S - psi_alpha))
+    # 2. Aleatoric Uncertainty (Ua)
+    # 依据公式: E[H(p|theta)]
+    psi_S = digamma(S + 1)
+    psi_alpha = digamma(alpha + 1)
+    aleatoric = torch.sum(probs * (psi_S - psi_alpha), dim=1)
 
-    # Aleatoric = total - epistemic
+    # 3. Epistemic Uncertainty (Ue)
     epistemic = total_entropy - aleatoric
 
-    return total_entropy.item(), epistemic.item(), aleatoric.item()
+    # 4. K/S (传统 EDL 衡量指标)
+    ks_metric = K / S.squeeze(1)
 
+    return total_entropy, epistemic, aleatoric, ks_metric
 
-def test_single_sample(model, dataloader, device):
+def run_inference(model, dataloader, device, num_classes):
+    """运行推理并收集结果"""
     model.eval()
-    model.to(device)
-
     results = []
-
+    
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Testing"):
-            inputs, labels = batch  # 必须是3个元素
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-
-            outputs = model(inputs)
+        for inputs, labels in tqdm(dataloader, leave=False):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs) # 在 EDL 中 outputs 即为 alpha
+            
             preds = torch.argmax(outputs, dim=1)
-
-            total_entropy, epistemic, aleatoric = edl_entropy_decomposition(outputs)
+            up, ue, ua, ks = edl_uncertainty_decomposition(outputs)
+            
             for i in range(len(labels)):
-                result = {
+                results.append({
                     'label': labels[i].item(),
                     'pred': preds[i].item(),
-                    'correct': preds[i].item() == labels[i].item(),
-                    'Up': total_entropy,
-                    'Ue': epistemic,
-                    'Ua': aleatoric,
-                    'K/s': num_classes/torch.sum(outputs).item()
-                }
-                results.append(result)
-
+                    'correct': (preds[i] == labels[i]).item(),
+                    'Up': up[i].item(),
+                    'Ue': ue[i].item(),
+                    'Ua': ua[i].item(),
+                    'K/s': ks[i].item()
+                })
     return results
 
-# 定义一些超参数
-model_name = 'resnet50'
-dataset_name = 'FGSC'
-method_name = 'trust_decomposition'
-optim_name='warmup+cosine'
-is_pre = False
-batch_size = 32
-num_epochs = 100   # 训练总轮数
-warmup_epochs = 10  # 学习率预热阶段
-max_lr = 1e-3      # 预热后的最大学习率0.001
-min_lr = 1e-6       # 余弦退火的最小学习率
-
-# save_path = './output/test_W'
-save_path = f'./output/{dataset_name}/{ "pretrained" if is_pre else "" }_{model_name}/v2/{method_name}_{optim_name}7-31-sig1-1-a0'
-for i in range(100):
-# i=1
-    model_path = f"./output/FGSC/_resnet50/v2/trust_decomposition_warmup+cosine7-31-sig1-1-a0/models/resnet50_model{i}.pth"
-    # 0. 路径管理
-    # models_save_path = os.path.join(save_path,'models')
-    # os.makedirs(models_save_path,exist_ok=True)
-    # logs_save_path = os.path.join(save_path,'logs')
-    # os.makedirs(logs_save_path,exist_ok=True)
-    results_save_path = os.path.join(save_path,'results')
-    os.makedirs(results_save_path,exist_ok=True)
-    # results_save_path = os.path.join(save_path,'results')
-    # os.makedirs(results_save_path,exist_ok=True)
-
-    # 1. 数据预处理
-    image_size=512
-    crop_size=448
-    train_transform = transforms.Compose(
-                [
-                    transforms.Resize((image_size, image_size)),
-                    transforms.RandomCrop(crop_size, padding=8),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-                ]
-            )
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.CenterCrop((crop_size, crop_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
-    )
-
-    train_path, test_path = local_dataset(dataset_name)   # 替换为你的测试集路径
-
-    # 2. 加载数据集
-    train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform)
-    test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform)
-
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-    print(train_dataset.classes)  # 类别名称列表
-    print(train_dataset.class_to_idx)  # 类别到索引的映射
-
-    # 如果是 Tensor，先转换成 list
-    label_list = train_dataset.targets
-    if isinstance(label_list, torch.Tensor):
-        label_list = label_list.tolist()
-
-    cls_num_list = Counter(label_list)
-    print(cls_num_list)
-
-    if 'cmo' in method_name.lower():
-        weighted_train_loader = CMO_weighted_train_loader(cls_num_list=list(cls_num_list.values()), train_dataset=train_dataset,
-                                                        batch_size=batch_size, weighted_alpha=1)
-
-    # 3. 加载预训练的ResNet50模型
-    model = models.resnet50(pretrained=is_pre)
-
-    # 4. 修改最后一层全连接层，以适应你的类别数
-    num_classes = len(train_dataset.classes)  # 计算类别数量
-    if 'trust' in method_name:
-        print('softplus')
-        model.fc = nn.Sequential(
-            nn.Linear(model.fc.in_features, num_classes),
-            nn.Softplus()
-        )
-    else:
-        model.fc = nn.Sequential(
-            nn.Linear(model.fc.in_features, num_classes),
-        )
-
-
-
-    checkpoint = torch.load(model_path)  # 加载保存的模型
-    model.load_state_dict(checkpoint)  # 将权重加载到模型中
-
-
-
-    # 5. 使用GPU（如果有）
+def main():
+    args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
+    
+    # 1. 路径准备
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    # 3. 测试模型
-    results = test_single_sample(model, test_loader, device)
-    results_train = test_single_sample(model, train_loader, device)
-    # 4. 保存结果
-    output_csv = os.path.join(results_save_path,f'test_results_{i}.csv')
-    df = pd.DataFrame(results)
-    df.to_csv(output_csv, index=False)
-    print(f"测试完成，结果保存至 {output_csv}")
+    # 2. 数据准备 (只需加载一次)
+    image_size, crop_size = 512, 448
+    test_transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.CenterCrop((crop_size, crop_size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    
+    train_path, test_path = local_dataset(args.dataset)
+    train_dataset = datasets.ImageFolder(root=train_path, transform=test_transform)
+    test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform)
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    
+    num_classes = len(train_dataset.classes)
+    print(f"Dataset: {args.dataset} | Classes: {num_classes}")
 
-    output_csv = os.path.join(results_save_path,f'train_results_{i}.csv')
-    df = pd.DataFrame(results_train)
-    df.to_csv(output_csv, index=False)
-    print(f"测试完成，结果保存至 {output_csv}")
+    # 3. 模型结构定义 (只需定义一次)
+    if args.model == 'resnet50':
+        model = models.resnet50(weights=None)
+    else:
+        raise NotImplementedError("Only resnet50 is configured in this script.")
